@@ -2,7 +2,8 @@
 Plugin Name
 Copyright (C) <Year> <Developer> <Email Address>
 
-This program is free software; you can redistribute it and/or modify
+This program is free software; you can redist
+ribute it and/or modify
 it under the terms of the GNU General Public License as published by
 the Free Software Foundation; either version 2 of the License, or
 (at your option) any later version.
@@ -18,6 +19,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #include <RubberBandStretcher.h>
 #include <crow.h>
+#include <crow/middlewares/cors.h>
 #include <memory>
 #include <obs-data.h>
 #include <obs-module.h>
@@ -32,14 +34,14 @@ OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
 struct WebPitchFilter {
   std::recursive_mutex mutex;
   std::unique_ptr<RubberBand::RubberBandStretcher> rubberband;
-  std::unique_ptr<crow::SimpleApp> app;
+  std::unique_ptr<crow::App<crow::CORSHandler>> app;
   std::unique_ptr<std::thread> thread;
   uint16_t port;
   std::string addr;
 
   WebPitchFilter(size_t sample_rate, size_t channels, uint16_t port = 8085,
                  std::string addr = "0.0.0.0")
-      : port(port), addr(addr), app(new crow::SimpleApp()) {
+      : port(port), addr(addr), app(new crow::App<crow::CORSHandler>()) {
     this->rubberband = std::make_unique<RubberBand::RubberBandStretcher>(
         sample_rate, channels,
         RubberBand::RubberBandStretcher::OptionProcessRealTime |
@@ -49,16 +51,23 @@ struct WebPitchFilter {
   void start_thread_server() {
     std::lock_guard<std::recursive_mutex> lock(this->mutex);
 
-    this->app.reset(new crow::SimpleApp());
+    this->app.reset(new crow::App<crow::CORSHandler>());
 
-    crow::SimpleApp& crowApp = *(this->app.get());
-    CROW_ROUTE(crowApp, "/").methods(crow::HTTPMethod::POST)([this](const crow::request& req) {
-        if (req.url_params.get("pitch") != nullptr) {
-            const auto pitch = std::stof(req.url_params.get("pitch"));
-            this->rubberband->setPitchScale(pitch);
-        }
-        return "OK";
-    });
+    crow::App<crow::CORSHandler> &crowApp = *(this->app.get());
+    auto &cors = crowApp.get_middleware<crow::CORSHandler>();
+    cors.global().methods("GET"_method).origin("*");
+    CROW_ROUTE(crowApp, "/")
+        .methods(crow::HTTPMethod::GET)(
+            [this](const crow::request &req, crow::response &res) {
+              res.add_header("Access-Control-Allow-Origin", "*");
+              res.add_header("Access-Control-Allow-Methods", "GET, OPTIONS");
+
+              if (req.url_params.get("pitch") != nullptr) {
+                const auto pitch = std::stof(req.url_params.get("pitch"));
+                this->rubberband->setPitchScale(pitch);
+              }
+              res.end();
+            });
     this->app->port(this->port).bindaddr(this->addr);
     this->thread.reset(new std::thread([this]() {
       try {
