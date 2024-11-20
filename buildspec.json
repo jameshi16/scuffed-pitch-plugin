@@ -36,8 +36,8 @@
             "bundleId": "com.example.obs-plugintemplate"
         }
     },
-    "name": "scuffed-voice-plugin",
-    "displayName": "Scuffed Voice Plugin",
+    "name": "scuffed-pitch-plugin",
+    "displayName": "Scuffed Pitch Plugin",
     "version": "1.0.0",
     "author": "vanorsigma",
     "website": "https://google.com",

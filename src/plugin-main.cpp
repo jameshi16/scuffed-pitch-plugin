@@ -17,22 +17,84 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 */
 
 #include <RubberBandStretcher.h>
+#include <crow.h>
+#include <memory>
+#include <obs-data.h>
 #include <obs-module.h>
+#include <obs-properties.h>
 #include <obs.h>
 #include <plugin-support.h>
+#include <thread>
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
 
-static RubberBand::RubberBandStretcher
-    rubberband(48000, 2,
-               RubberBand::RubberBandStretcher::OptionProcessRealTime |
-                   RubberBand::RubberBandStretcher::OptionPitchHighQuality);
+struct WebPitchFilter {
+  std::recursive_mutex mutex;
+  std::unique_ptr<RubberBand::RubberBandStretcher> rubberband;
+  std::unique_ptr<crow::SimpleApp> app;
+  std::unique_ptr<std::thread> thread;
+  uint16_t port;
+  std::string addr;
 
-static struct obs_audio_data *process_audio(void *, obs_audio_data *audio) {
-  rubberband.process((float **)audio->data, audio->frames, false);
+  WebPitchFilter(size_t sample_rate, size_t channels, uint16_t port = 8085,
+                 std::string addr = "0.0.0.0")
+      : port(port), addr(addr), app(new crow::SimpleApp()) {
+    this->rubberband = std::make_unique<RubberBand::RubberBandStretcher>(
+        sample_rate, channels,
+        RubberBand::RubberBandStretcher::OptionProcessRealTime |
+            RubberBand::RubberBandStretcher::OptionPitchHighQuality);
+  }
 
-  if ((size_t) rubberband.available() < audio->frames) {
+  void start_thread_server() {
+    std::lock_guard<std::recursive_mutex> lock(this->mutex);
+
+    this->app.reset(new crow::SimpleApp());
+
+    crow::SimpleApp& crowApp = *(this->app.get());
+    CROW_ROUTE(crowApp, "/").methods(crow::HTTPMethod::POST)([this](const crow::request& req) {
+        if (req.url_params.get("pitch") != nullptr) {
+            const auto pitch = std::stof(req.url_params.get("pitch"));
+            this->rubberband->setPitchScale(pitch);
+        }
+        return "OK";
+    });
+    this->app->port(this->port).bindaddr(this->addr);
+    this->thread.reset(new std::thread([this]() {
+      try {
+        this->app->run();
+      } catch (const std::system_error &e) {
+        obs_log(LOG_ERROR,
+                "Error in server thread, probably port is already used %s",
+                e.what());
+      }
+    }));
+  }
+
+  void stop_thread_server() {
+    obs_log(LOG_INFO, "stopping the thread server %d",
+            std::this_thread::get_id());
+    std::lock_guard<std::recursive_mutex> lock(this->mutex);
+
+    // NOTE: assumption that stop is thread-safe
+    obs_log(LOG_INFO, "Stopping app server");
+    if (this->thread && this->thread->joinable()) {
+      // TODO: When the server is stop, it does not release the binding, which
+      // means that I cannot restart the server.
+
+      this->app->stop();
+      this->thread->join();
+      free(this->app.release());
+    }
+  }
+};
+
+static struct obs_audio_data *process_audio(void *data, obs_audio_data *audio) {
+  WebPitchFilter *filter = reinterpret_cast<WebPitchFilter *>(data);
+  auto rubberband = filter->rubberband.get();
+  rubberband->process((float **)audio->data, audio->frames, false);
+
+  if ((size_t)rubberband->available() < audio->frames) {
     obs_log(LOG_INFO, "Rubberband isn't ready, zeroing");
     for (int c = 0; c < MAX_AV_PLANES; c++) {
       if (audio->data[c] != nullptr) {
@@ -45,9 +107,71 @@ static struct obs_audio_data *process_audio(void *, obs_audio_data *audio) {
     return audio;
   }
 
-  rubberband.retrieve((float **)audio->data, audio->frames);
-
+  rubberband->retrieve((float **)audio->data, audio->frames);
   return audio;
+}
+
+void destroy_web_pitch_filter(void *data) {
+  // NOTE: weird mix of C++ and C here, because I'm using obs's allocator
+  WebPitchFilter *filter = reinterpret_cast<WebPitchFilter *>(data);
+  filter->stop_thread_server();
+
+  free(filter->rubberband.release());
+  free(filter->app.release());
+  free(filter->thread.release());
+  bfree(filter);
+}
+
+static bool start_server(obs_properties_t *, obs_property_t *, void *data) {
+  WebPitchFilter *filter = reinterpret_cast<WebPitchFilter *>(data);
+  filter->start_thread_server();
+  return false;
+}
+
+static bool end_server(obs_properties_t *, obs_property_t *, void *data) {
+  WebPitchFilter *filter = reinterpret_cast<WebPitchFilter *>(data);
+  filter->stop_thread_server();
+  return false;
+}
+
+static obs_properties_t *web_pitch_properties(void *) {
+  obs_properties_t *props = obs_properties_create();
+  obs_properties_add_text(props, "web_addr", "Listen Address",
+                          OBS_TEXT_DEFAULT);
+  obs_properties_add_int(props, "web_port", "Web Port", 0, 65535, 1);
+  return props;
+}
+
+static void web_pitch_defaults(obs_data_t *settings) {
+  obs_data_set_default_string(settings, "web_addr", "0.0.0.0");
+  obs_data_set_default_int(settings, "web_port", 8085);
+}
+
+void *create_web_pitch_filter(obs_data_t *settings, obs_source_t *) {
+  // TODO: It'll be a good idea to figure out sample rate and channel here, but
+  // I also don't want to import obs-studio's internal headers, so I'll just
+  // guess them here.
+  const int sample_rate = 48000;
+  const int channels = 2;
+  auto port = (uint16_t)obs_data_get_int(settings, "web_port");
+  auto addr = obs_data_get_string(settings, "web_addr");
+
+  // a little roundabout, but we'll initialize a version of the filter here,
+  // then move it into OBS's memory management
+  WebPitchFilter *filter =
+      new WebPitchFilter(sample_rate, channels, port, addr);
+  WebPitchFilter *data =
+      reinterpret_cast<WebPitchFilter *>(bzalloc(sizeof(WebPitchFilter)));
+  data->rubberband = std::move(filter->rubberband);
+  data->app = std::move(filter->app);
+  data->addr = filter->addr;
+  data->port = filter->port;
+
+  data->start_thread_server();
+  free(filter);
+  obs_log(LOG_INFO, "Address of data is: %p", data);
+
+  return data;
 }
 
 struct obs_source_info pitch_shift_filter = {
@@ -55,16 +179,17 @@ struct obs_source_info pitch_shift_filter = {
     .type = OBS_SOURCE_TYPE_FILTER,
     .output_flags = OBS_SOURCE_AUDIO,
     .get_name = [](void *) { return "Pitch Shift Filter"; },
-    .create = [](obs_data *, obs_source *) { return (void *)'c'; },
-    .destroy = [](void *) {},
-    .update = [](void *, obs_data *) {},
+    .create = create_web_pitch_filter,
+    .destroy = destroy_web_pitch_filter,
+    .get_defaults = web_pitch_defaults,
+    .get_properties = web_pitch_properties,
     .filter_audio = process_audio,
 };
 
 bool obs_module_load(void) {
-  rubberband.setPitchScale(2.0);
   obs_register_source(&pitch_shift_filter);
-  obs_log(LOG_INFO, "plugin loaded successfully (version %s)", PLUGIN_VERSION);
+  obs_log(LOG_INFO, "Pitch Shift Filter loaded successfully (version %s)",
+          PLUGIN_VERSION);
   return true;
 }
 
