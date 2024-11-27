@@ -65,7 +65,8 @@ struct WebPitchFilter {
               if (req.url_params.get("pitch") != nullptr) {
                 const auto pitch = std::stof(req.url_params.get("pitch"));
                 this->rubberband->setPitchScale(pitch);
-                this->rubberband->reset();
+                // TODO: This is broken
+                // this->rubberband->reset();
               }
               res.end();
             });
@@ -118,6 +119,16 @@ static struct obs_audio_data *process_audio(void *data, obs_audio_data *audio) {
   }
 
   rubberband->retrieve((float **)audio->data, audio->frames);
+
+  // HACK: Mono the audio to bypass synchronization issues
+  for (int c = 1; c < MAX_AV_PLANES; c++) {
+      if (audio->data[c] != nullptr) {
+          for (size_t i = 0; i < audio->frames; i++) {
+              audio->data[c][i] = audio->data[0][i];
+          }
+      }
+  }
+
   return audio;
 }
 
