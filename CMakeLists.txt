@@ -41,6 +41,7 @@ FetchContent_MakeAvailable(Crow)
 
 add_library(${CMAKE_PROJECT_NAME} MODULE)
 
+target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE "$${CMAKE_CURRENT_BINARY_DIR}/rubberband-prefix/src/rubberband/lib")
 target_include_directories(
   ${CMAKE_PROJECT_NAME}
   PUBLIC
