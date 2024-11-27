@@ -65,6 +65,7 @@ struct WebPitchFilter {
               if (req.url_params.get("pitch") != nullptr) {
                 const auto pitch = std::stof(req.url_params.get("pitch"));
                 this->rubberband->setPitchScale(pitch);
+                this->rubberband->reset();
               }
               res.end();
             });
