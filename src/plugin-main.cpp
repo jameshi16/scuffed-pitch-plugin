@@ -18,6 +18,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 */
 
 #include <RubberBandStretcher.h>
+#include <algorithm>
 #include <crow.h>
 #include <crow/middlewares/cors.h>
 #include <memory>
@@ -33,6 +34,7 @@ OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
 
 struct WebPitchFilter {
   std::recursive_mutex mutex;
+  std::mutex audio_mutex;
   std::unique_ptr<RubberBand::RubberBandStretcher> rubberband;
   std::unique_ptr<crow::App<crow::CORSHandler>> app;
   std::unique_ptr<std::thread> thread;
@@ -45,7 +47,11 @@ struct WebPitchFilter {
     this->rubberband = std::make_unique<RubberBand::RubberBandStretcher>(
         sample_rate, channels,
         RubberBand::RubberBandStretcher::OptionProcessRealTime |
-            RubberBand::RubberBandStretcher::OptionPitchHighQuality);
+            RubberBand::RubberBandStretcher::OptionThreadingNever |
+            RubberBand::RubberBandStretcher::OptionWindowShort |
+            RubberBand::RubberBandStretcher::OptionPitchHighConsistency |
+            RubberBand::RubberBandStretcher::OptionEngineFiner |
+            RubberBand::RubberBandStretcher::OptionSmoothingOn);
   }
 
   void start_thread_server() {
@@ -64,9 +70,10 @@ struct WebPitchFilter {
 
               if (req.url_params.get("pitch") != nullptr) {
                 const auto pitch = std::stof(req.url_params.get("pitch"));
-                this->rubberband->setPitchScale(pitch);
-                // TODO: This is broken
-                // this->rubberband->reset();
+                // NOTE: Clamped pitch, because any higher might cause desyncs
+                this->rubberband->setPitchScale(
+                    std::max(0.75f, std::min(pitch, 1.5f)));
+                this->rubberband->reset();
               }
               res.end();
             });
@@ -102,6 +109,7 @@ struct WebPitchFilter {
 
 static struct obs_audio_data *process_audio(void *data, obs_audio_data *audio) {
   WebPitchFilter *filter = reinterpret_cast<WebPitchFilter *>(data);
+  std::lock_guard<std::mutex> lock(filter->audio_mutex);
   auto rubberband = filter->rubberband.get();
   rubberband->process((float **)audio->data, audio->frames, false);
 
@@ -122,11 +130,11 @@ static struct obs_audio_data *process_audio(void *data, obs_audio_data *audio) {
 
   // HACK: Mono the audio to bypass synchronization issues
   for (int c = 1; c < MAX_AV_PLANES; c++) {
-      if (audio->data[c] != nullptr) {
-          for (size_t i = 0; i < audio->frames; i++) {
-              audio->data[c][i] = audio->data[0][i];
-          }
+    if (audio->data[c] != nullptr) {
+      for (size_t i = 0; i < audio->frames; i++) {
+        audio->data[c][i] = audio->data[0][i];
       }
+    }
   }
 
   return audio;
@@ -135,6 +143,7 @@ static struct obs_audio_data *process_audio(void *data, obs_audio_data *audio) {
 void destroy_web_pitch_filter(void *data) {
   // NOTE: weird mix of C++ and C here, because I'm using obs's allocator
   WebPitchFilter *filter = reinterpret_cast<WebPitchFilter *>(data);
+  std::lock_guard<std::mutex> lock(filter->audio_mutex);
   filter->stop_thread_server();
 
   free(filter->rubberband.release());
