@@ -111,14 +111,15 @@ static struct obs_audio_data *process_audio(void *data, obs_audio_data *audio) {
   WebPitchFilter *filter = reinterpret_cast<WebPitchFilter *>(data);
   std::lock_guard<std::mutex> lock(filter->audio_mutex);
   auto rubberband = filter->rubberband.get();
-  rubberband->process((float **)audio->data, audio->frames, false);
+  float** audiodata = (float**)audio->data;
+  rubberband->process(audiodata, audio->frames, false);
 
   if ((size_t)rubberband->available() < audio->frames) {
     obs_log(LOG_INFO, "Rubberband isn't ready, zeroing");
     for (int c = 0; c < MAX_AV_PLANES; c++) {
-      if (audio->data[c] != nullptr) {
+      if (audiodata[c] != nullptr) {
         for (size_t i = 0; i < audio->frames; i++) {
-          audio->data[c][i] = 0.0;
+          audiodata[c][i] = 0.0;
         }
       }
     }
@@ -126,13 +127,13 @@ static struct obs_audio_data *process_audio(void *data, obs_audio_data *audio) {
     return audio;
   }
 
-  rubberband->retrieve((float **)audio->data, audio->frames);
+  rubberband->retrieve(audiodata, audio->frames);
 
   // HACK: Mono the audio to bypass synchronization issues
   for (int c = 1; c < MAX_AV_PLANES; c++) {
-    if (audio->data[c] != nullptr) {
+    if (audiodata[c] != nullptr) {
       for (size_t i = 0; i < audio->frames; i++) {
-        audio->data[c][i] = audio->data[0][i];
+        audiodata[c][i] = audiodata[0][i];
       }
     }
   }
